@@ -1,13 +1,47 @@
 import sys
 import os
 import time
+import requests
 from yt_dlp import YoutubeDL
 from moviepy.editor import VideoFileClip
 from elevenlabs.client import ElevenLabs
 
+def download_tiktok_api(url, output_path="downloaded_video.mp4"):
+    print(f"Attempting to download TikTok video via API: {url}")
+    api_url = f"https://www.tikwm.com/api/?url={url}"
+    res = requests.get(api_url).json()
+    if res.get("code") == 0:
+        video_bytes = requests.get(res["data"]["play"]).content
+        with open(output_path, "wb") as f:
+            f.write(video_bytes)
+        print("TikTok video downloaded successfully via API!")
+        return output_path
+    else:
+        raise Exception("Failed to fetch TikTok video via API.")
+
 def download_video(url, output_path="downloaded_video.mp4"):
     print(f"Downloading video from {url}...")
-    ydl_opts = {'outtmpl': output_path, 'format': 'mp4/best'}
+    
+    # ถ้าเป็นลิงก์ TikTok ให้ใช้ API พิเศษหลบระบบบล็อก
+    if "tiktok.com" in url:
+        try:
+            return download_tiktok_api(url, output_path)
+        except Exception as e:
+            print(f"API download failed, falling back to yt-dlp: {e}")
+
+    # ตัวเลือกสำหรับ YouTube / ลิงก์ทั่วไป
+    ydl_opts = {
+        'outtmpl': output_path,
+        'format': 'mp4/best',
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+            }
+        }
+    }
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
     return output_path
@@ -70,9 +104,3 @@ if __name__ == "__main__":
     raw_video = download_video(video_url)
     short_video = convert_to_vertical_short(raw_video, start_sec=start_time, end_sec=end_time)
     translate_to_thai(short_video)
-
-
-
-
-
-
