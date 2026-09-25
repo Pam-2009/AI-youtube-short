@@ -2,48 +2,42 @@ import sys
 import os
 import time
 import requests
-from yt_dlp import YoutubeDL
 from moviepy.editor import VideoFileClip
 from elevenlabs.client import ElevenLabs
 
-def download_tiktok_api(url, output_path="downloaded_video.mp4"):
-    print(f"Attempting to download TikTok video via API: {url}")
-    api_url = f"https://www.tikwm.com/api/?url={url}"
-    res = requests.get(api_url).json()
-    if res.get("code") == 0:
-        video_bytes = requests.get(res["data"]["play"]).content
-        with open(output_path, "wb") as f:
-            f.write(video_bytes)
-        print("TikTok video downloaded successfully via API!")
-        return output_path
-    else:
-        raise Exception("Failed to fetch TikTok video via API.")
-
-def download_video(url, output_path="downloaded_video.mp4"):
-    print(f"Downloading video from {url}...")
+def download_video_via_cobalt(url, output_path="downloaded_video.mp4"):
+    print(f"Fetching direct download link via Cobalt API for: {url}")
     
-    # ถ้าเป็นลิงก์ TikTok ให้ใช้ API พิเศษหลบระบบบล็อก
-    if "tiktok.com" in url:
-        try:
-            return download_tiktok_api(url, output_path)
-        except Exception as e:
-            print(f"API download failed, falling back to yt-dlp: {e}")
-
-    # ตัวเลือกสำหรับ YouTube / ลิงก์ทั่วไป
-    ydl_opts = {
-        'outtmpl': output_path,
-        'format': 'mp4/best',
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        },
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web'],
-            }
-        }
+    # ส่ง Request ไปยัง Cobalt API Public Instance
+    api_url = "https://api.cobalt.tools/api/json"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    payload = {
+        "url": url,
+        "vCodec": "h264"
+    }
+    
+    response = requests.post(api_url, json=payload, headers=headers)
+    data = response.json()
+    
+    # ตรวจสอบสถานะการดึงข้อมูล
+    if data.get("status") in ["stream", "redirect"]:
+        download_url = data.get("url")
+    elif data.get("status") == "picker":
+        download_url = data["picker"][0]["url"]
+    else:
+        raise Exception(f"Cobalt API failed: {data.get('text', 'Unknown error')}")
+
+    print("Downloading video stream...")
+    video_data = requests.get(download_url, stream=True)
+    with open(output_path, "wb") as f:
+        for chunk in video_data.iter_content(chunk_size=1024*1024):
+            if chunk:
+                f.write(chunk)
+                
+    print("Video downloaded successfully!")
     return output_path
 
 def convert_to_vertical_short(input_path, output_path="short_clip.mp4", start_sec=0, end_sec=30):
@@ -101,6 +95,6 @@ if __name__ == "__main__":
     start_time = sys.argv[2] if len(sys.argv) > 2 else 0
     end_time = sys.argv[3] if len(sys.argv) > 3 else 30
     
-    raw_video = download_video(video_url)
+    raw_video = download_video_via_cobalt(video_url)
     short_video = convert_to_vertical_short(raw_video, start_sec=start_time, end_sec=end_time)
     translate_to_thai(short_video)
