@@ -1,48 +1,31 @@
 import sys
 import os
 import time
-import requests
+import yt_dlp
 from moviepy.editor import VideoFileClip
 from elevenlabs.client import ElevenLabs
 
-def download_video_via_cobalt(url, output_path="downloaded_video.mp4"):
-    print(f"Fetching direct download link via Cobalt API for: {url}")
-    
-    # ส่ง Request ไปยัง Cobalt API Public Instance
-    api_url = "https://api.cobalt.tools/api/json"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
+def download_video(url, output_path="downloaded_video.mp4"):
+    # Cobalt v7 API ถูกปิดไปแล้ว (พ.ย. 2024) จึงใช้ yt-dlp ดาวน์โหลดแทน (รองรับ YouTube / TikTok)
+    print(f"Downloading video via yt-dlp: {url}")
+    ydl_opts = {
+        "outtmpl": output_path,
+        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
     }
-    payload = {
-        "url": url,
-        "vCodec": "h264"
-    }
-    
-    response = requests.post(api_url, json=payload, headers=headers)
-    data = response.json()
-    
-    # ตรวจสอบสถานะการดึงข้อมูล
-    if data.get("status") in ["stream", "redirect"]:
-        download_url = data.get("url")
-    elif data.get("status") == "picker":
-        download_url = data["picker"][0]["url"]
-    else:
-        raise Exception(f"Cobalt API failed: {data.get('text', 'Unknown error')}")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
-    print("Downloading video stream...")
-    video_data = requests.get(download_url, stream=True)
-    with open(output_path, "wb") as f:
-        for chunk in video_data.iter_content(chunk_size=1024*1024):
-            if chunk:
-                f.write(chunk)
-                
     print("Video downloaded successfully!")
     return output_path
 
 def convert_to_vertical_short(input_path, output_path="short_clip.mp4", start_sec=0, end_sec=30):
     print(f"Trimming and cropping video ({start_sec}s to {end_sec}s)...")
-    clip = VideoFileClip(input_path).subclip(int(start_sec), int(end_sec))
+    clip = VideoFileClip(input_path)
+    # กันไม่ให้ end_sec เกินความยาววิดีโอ (เช่นคลิป TikTok ที่สั้นกว่า 30 วิ)
+    end_sec = min(float(end_sec), clip.duration)
+    clip = clip.subclip(float(start_sec), end_sec)
     
     # Crop to 9:16 vertical ratio
     w, h = clip.size
@@ -63,7 +46,7 @@ def translate_to_thai(file_path, output_path="output_thai_short.mp4"):
     print("Sending video to ElevenLabs for Thai dubbing...")
     
     with open(file_path, "rb") as video_file:
-        response = client.dubbing.dub_a_video_or_audio_file(
+        response = client.dubbing.create(
             file=video_file,
             target_lang="th",
             source_lang="auto"
@@ -74,7 +57,7 @@ def translate_to_thai(file_path, output_path="output_thai_short.mp4"):
     
     # Poll for completion
     while True:
-        status_info = client.dubbing.get_dubbing_project_metadata(dubbing_id)
+        status_info = client.dubbing.get(dubbing_id)
         status = status_info.status
         print(f"Current Status: {status}")
         if status == "dubbed":
@@ -84,7 +67,7 @@ def translate_to_thai(file_path, output_path="output_thai_short.mp4"):
         time.sleep(10)
         
     # Download dubbed result
-    dubbed_file = client.dubbing.get_dubbed_file(dubbing_id, target_lang="th")
+    dubbed_file = client.dubbing.audio.get(dubbing_id, "th")
     with open(output_path, "wb") as f:
         for chunk in dubbed_file:
             f.write(chunk)
@@ -95,6 +78,6 @@ if __name__ == "__main__":
     start_time = sys.argv[2] if len(sys.argv) > 2 else 0
     end_time = sys.argv[3] if len(sys.argv) > 3 else 30
     
-    raw_video = download_video_via_cobalt(video_url)
+    raw_video = download_video(video_url)
     short_video = convert_to_vertical_short(raw_video, start_sec=start_time, end_sec=end_time)
     translate_to_thai(short_video)
