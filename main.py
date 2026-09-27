@@ -1,8 +1,10 @@
 import sys
 import os
-import time
+import subprocess
+import anthropic
 import yt_dlp
-from moviepy.editor import VideoFileClip
+from imageio_ffmpeg import get_ffmpeg_exe
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
 from elevenlabs.client import ElevenLabs
 
 def download_video(url, output_path="downloaded_video.mp4"):
@@ -37,40 +39,99 @@ def convert_to_vertical_short(input_path, output_path="short_clip.mp4", start_se
     clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
     return output_path
 
+# ElevenLabs Dubbing ไม่รองรับภาษาไทย จึงทำ 3 ขั้นตอนเอง:
+# ถอดเสียงเป็นข้อความ -> แปลเป็นไทยด้วย Claude -> ให้เสียง ElevenLabs อ่านภาษาไทยทับวิดีโอ
+DEFAULT_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # เปลี่ยนได้ด้วย ELEVENLABS_VOICE_ID
+
+
+def transcribe(client, file_path):
+    print("Transcribing speech with ElevenLabs...")
+    with open(file_path, "rb") as f:
+        result = client.speech_to_text.convert(file=f, model_id="scribe_v2")
+    text = result.text.strip()
+    if not text:
+        raise Exception("No speech found in the video, nothing to translate.")
+    print(f"Transcript ({result.language_code}): {text}")
+    return text
+
+
+def translate_text_to_thai(text, duration_sec):
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise ValueError("ANTHROPIC_API_KEY environment variable is not set.")
+
+    print("Translating to Thai with Claude...")
+    client = anthropic.Anthropic()
+    response = client.beta.messages.create(
+        model="claude-opus-5",
+        max_tokens=16000,
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+        output_config={"effort": "low"},
+        system=(
+            "You translate short-video voice-overs into natural, casual spoken Thai. "
+            "Reply with only the Thai translation, no notes or quotes. "
+            f"It will be read aloud over a {duration_sec:.0f}-second clip, "
+            "so keep it about as long as the original."
+        ),
+        messages=[{"role": "user", "content": text}],
+    )
+    if response.stop_reason == "refusal":
+        raise Exception("Claude declined to translate this transcript.")
+    thai = "".join(b.text for b in response.content if b.type == "text").strip()
+    print(f"Thai: {thai}")
+    return thai
+
+
+def fit_audio_to_length(audio_path, max_sec):
+    # ถ้าเสียงไทยยาวกว่าวิดีโอ ให้เร่งความเร็ว (atempo รับได้สูงสุด 2.0 ต่อครั้ง)
+    duration = AudioFileClip(audio_path).duration
+    if duration <= max_sec:
+        return audio_path
+    speed = duration / max_sec
+    filters = []
+    while speed > 2.0:
+        filters.append("atempo=2.0")
+        speed /= 2.0
+    filters.append(f"atempo={speed:.4f}")
+    fitted_path = "thai_voice_fitted.mp3"
+    subprocess.run(
+        [get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", audio_path,
+         "-filter:a", ",".join(filters), fitted_path],
+        check=True,
+    )
+    return fitted_path
+
+
 def translate_to_thai(file_path, output_path="output_thai_short.mp4"):
     api_key = os.getenv("ELEVENLABS_API_KEY")
     if not api_key:
         raise ValueError("ELEVENLABS_API_KEY environment variable is not set.")
-    
+
     client = ElevenLabs(api_key=api_key)
-    print("Sending video to ElevenLabs for Thai dubbing...")
-    
-    with open(file_path, "rb") as video_file:
-        response = client.dubbing.create(
-            file=video_file,
-            target_lang="th",
-            source_lang="auto"
-        )
-    
-    dubbing_id = response.dubbing_id
-    print(f"Dubbing started. Job ID: {dubbing_id}")
-    
-    # Poll for completion
-    while True:
-        status_info = client.dubbing.get(dubbing_id)
-        status = status_info.status
-        print(f"Current Status: {status}")
-        if status == "dubbed":
-            break
-        elif status == "failed":
-            raise Exception("Dubbing job failed on ElevenLabs.")
-        time.sleep(10)
-        
-    # Download dubbed result
-    dubbed_file = client.dubbing.audio.get(dubbing_id, "th")
-    with open(output_path, "wb") as f:
-        for chunk in dubbed_file:
+    video = VideoFileClip(file_path)
+
+    text = transcribe(client, file_path)
+    thai = translate_text_to_thai(text, video.duration)
+
+    print("Generating Thai voice with ElevenLabs...")
+    voice_path = "thai_voice.mp3"
+    audio = client.text_to_speech.convert(
+        voice_id=os.getenv("ELEVENLABS_VOICE_ID") or DEFAULT_VOICE_ID,
+        text=thai,
+        model_id="eleven_v3",
+        output_format="mp3_44100_128",
+    )
+    with open(voice_path, "wb") as f:
+        for chunk in audio:
             f.write(chunk)
+
+    # เสียงไทยอยู่ด้านหน้า เสียงต้นฉบับ (เพลง/เอฟเฟกต์) เบาลงเหลือ 15%
+    thai_voice = AudioFileClip(fit_audio_to_length(voice_path, video.duration))
+    tracks = [thai_voice]
+    if video.audio is not None:
+        tracks.insert(0, video.audio.volumex(0.15))
+    final = video.set_audio(CompositeAudioClip(tracks).set_duration(video.duration))
+    final.write_videofile(output_path, codec="libx264", audio_codec="aac")
     print("Thai translation complete!")
 
 if __name__ == "__main__":
