@@ -6,11 +6,13 @@ import time
 import anthropic
 import yt_dlp
 import shutil
+import base64
+import numpy as np
 import cv2
 import pytesseract
 from deep_translator import GoogleTranslator, MyMemoryTranslator
 from imageio_ffmpeg import get_ffmpeg_exe
-from moviepy.editor import VideoFileClip, AudioFileClip
+from moviepy.editor import VideoFileClip, AudioFileClip, vfx
 from pythainlp.tokenize import word_tokenize
 from elevenlabs.client import ElevenLabs
 from elevenlabs.types import VoiceSettings
@@ -124,62 +126,101 @@ def pick_thai_voice(client):
                 return v.voice_id
 
         shared = client.voices.get_shared(language="th", sort="cloned_by_count", page_size=20).voices
-        for v in shared:
-            if not v.free_users_allowed:
-                continue
-            added = client.voices.share(
-                public_user_id=v.public_owner_id,
-                voice_id=v.voice_id,
-                new_name=f"{THAI_VOICE_PREFIX}{v.name}",
-            )
+        print(f"Found {len(shared)} Thai voices in the ElevenLabs library")
+        # เรียงให้เสียงที่บัญชีฟรีใช้ได้มาก่อน
+        for v in sorted(shared, key=lambda v: not v.free_users_allowed):
+            try:
+                added = client.voices.share(
+                    public_user_id=v.public_owner_id,
+                    voice_id=v.voice_id,
+                    new_name=f"{THAI_VOICE_PREFIX}{v.name}",
+                )
+            except Exception as e:
+                print(f"Can't add library voice {v.name}: {e}")
+                break
             print(f"Added Thai voice from library: {v.name}")
             return added.voice_id
     except Exception as e:
-        print(f"Could not get a Thai voice from the library ({e}), using default voice.")
+        print(f"Could not search the voice library ({e})")
+    print("Using the default voice (a Thai library voice needs a paid ElevenLabs plan)")
     return DEFAULT_VOICE_ID
 
 
-def fit_audio_to_length(audio_path, max_sec):
-    # ถ้าเสียงไทยยาวกว่าวิดีโอ ให้เร่งความเร็ว (atempo รับได้สูงสุด 2.0 ต่อครั้ง)
+MAX_VOICE_SPEEDUP = 1.2  # เร่งเสียงเกินนี้แล้วฟังไม่เป็นธรรมชาติ
+
+
+def fit_voice_to_video(audio_path, video):
+    # ถ้าเสียงไทยยาวกว่าวิดีโอ: เร่งเสียงได้ไม่เกิน 1.2 เท่า ส่วนที่เหลือให้วิดีโอช้าลงแทน
     duration = AudioFileClip(audio_path).duration
-    if duration <= max_sec:
-        return audio_path
-    speed = duration / max_sec
-    print(f"Thai voice is {duration:.1f}s, speeding up x{speed:.2f} to fit the video")
-    filters = []
-    while speed > 2.0:
-        filters.append("atempo=2.0")
-        speed /= 2.0
-    filters.append(f"atempo={speed:.4f}")
+    if duration <= video.duration:
+        return AudioFileClip(audio_path), video
+    speed = min(duration / video.duration, MAX_VOICE_SPEEDUP)
+    print(f"Thai voice is {duration:.1f}s for a {video.duration:.1f}s video, speeding voice up x{speed:.2f}")
     fitted_path = "thai_voice_fitted.mp3"
     subprocess.run(
         [get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", audio_path,
-         "-filter:a", ",".join(filters), fitted_path],
+         "-filter:a", f"atempo={speed:.4f}", fitted_path],
         check=True,
     )
-    return fitted_path
+    voice = AudioFileClip(fitted_path)
+    if voice.duration > video.duration:
+        factor = video.duration / voice.duration
+        print(f"Slowing the video to x{factor:.2f} so the voice fits")
+        video = video.fx(vfx.speedx, factor).set_duration(voice.duration)
+    return voice, video
 
 
-def find_english_text(video, step=0.25):
-    # อ่านตัวหนังสือบนวิดีโอด้วย OCR ทุก ๆ 0.25 วินาที เพื่อหาตำแหน่งที่ต้องเบลอ
+def caption_masks(rgb):
+    # ซับ TikTok มักเป็นตัวขาวหรือเหลืองขอบดำ: แยกเฉพาะพิกเซลสีขาว/เหลืองออกมา
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    white = (hsv[..., 2] > 200) & (hsv[..., 1] < 60)
+    yellow = (hsv[..., 0] >= 18) & (hsv[..., 0] <= 35) & (hsv[..., 1] > 120) & (hsv[..., 2] > 170)
+    return white, yellow
+
+
+def find_caption_boxes(rgb, seen):
+    # หาแถบตัวหนังสือ (กว้าง ๆ เตี้ย ๆ) แล้วให้ OCR ยืนยันว่ามีตัวอักษรภาษาอังกฤษจริง
+    img_h, img_w = rgb.shape[:2]
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 9))
+    boxes = []
+    for mask in caption_masks(rgb):
+        mask8 = mask.astype(np.uint8) * 255
+        merged = cv2.morphologyEx(mask8, cv2.MORPH_CLOSE, kernel)
+        _, _, stats, _ = cv2.connectedComponentsWithStats(merged)
+        for x, y, w, h, _ in stats[1:]:
+            if not (15 <= h <= img_h * 0.15 and w >= 1.5 * h):
+                continue
+            fill = mask[y:y + h, x:x + w].mean()
+            if not 0.08 <= fill <= 0.7:
+                continue
+            crop = 255 - mask8[max(0, y - 6):y + h + 6, max(0, x - 6):x + w + 6]
+            crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+            text = pytesseract.image_to_string(crop, config="--psm 7").strip()
+            if len(re.findall(r"[A-Za-z]", text)) >= 3:
+                boxes.append((x, y, w, h))
+                seen.add(text)
+    return boxes
+
+
+def find_english_text(video, step=0.5):
+    # ตรวจทุก ๆ ครึ่งวินาทีว่ามีตัวหนังสืออังกฤษบนจอตรงไหนบ้าง
     print("Looking for English text on screen...")
-    samples = []
-    seen = set()
+    samples, seen = [], set()
     t = 0.0
     while t < video.duration:
-        gray = cv2.cvtColor(video.get_frame(t), cv2.COLOR_RGB2GRAY)
-        boxes = []
-        # ซับ TikTok มักเป็นตัวขาวขอบดำ จึงอ่านทั้งภาพปกติและภาพกลับสี
-        for img in (gray, 255 - gray):
-            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-            for i, word in enumerate(data["text"]):
-                if float(data["conf"][i]) >= 50 and re.search(r"[A-Za-z0-9]{2,}", word):
-                    boxes.append((data["left"][i], data["top"][i], data["width"][i], data["height"][i]))
-                    seen.add(word)
-        samples.append((t, boxes))
+        samples.append((t, find_caption_boxes(video.get_frame(t), seen)))
         t += step
-    print(f"Found English words: {' '.join(sorted(seen)) or '(none)'}")
+    print(f"Found English text: {' | '.join(sorted(seen)) or '(none)'}")
     return samples, step
+
+
+def log_preview_frames(clip, label):
+    # พิมพ์ภาพตัวอย่างเล็ก ๆ ลง log (base64) ไว้ตรวจผลงานโดยไม่ต้องดาวน์โหลดวิดีโอ
+    for frac in (0.2, 0.5, 0.8):
+        t = clip.duration * frac
+        frame = cv2.resize(cv2.cvtColor(clip.get_frame(t), cv2.COLOR_RGB2BGR), (270, 480))
+        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        print(f"PREVIEW {label} t={t:.1f} {base64.b64encode(jpg.tobytes()).decode()}")
 
 
 def blur_boxes(frame, boxes, pad=12):
@@ -284,11 +325,14 @@ def translate_to_thai(file_path, output_path="output_thai_short.mp4"):
     with open(voice_path, "wb") as f:
         for chunk in audio:
             f.write(chunk)
-    thai_voice = AudioFileClip(fit_audio_to_length(voice_path, video.duration))
 
-    # ตัดเสียงต้นฉบับ (เสียงพูดภาษาอังกฤษ) ออกทั้งหมด ใช้เสียงไทยอย่างเดียว
+    log_preview_frames(video, "original")
+    # หาตัวหนังสือจากวิดีโอต้นฉบับก่อนเปลี่ยนความเร็ว
     samples, step = find_english_text(video)
-    cleaned = remove_english_text(video, samples, step).set_audio(thai_voice)
+    cleaned = remove_english_text(video, samples, step)
+    thai_voice, cleaned = fit_voice_to_video(voice_path, cleaned)
+    # ตัดเสียงต้นฉบับ (เสียงพูดภาษาอังกฤษ) ออกทั้งหมด ใช้เสียงไทยอย่างเดียว
+    cleaned = cleaned.set_audio(thai_voice)
     cleaned.write_videofile("thai_no_subs.mp4", codec="libx264", audio_codec="aac")
 
     subs = write_thai_subtitles(thai, thai_voice.duration, video.size, samples)
@@ -298,6 +342,7 @@ def translate_to_thai(file_path, output_path="output_thai_short.mp4"):
          "-vf", f"ass={subs}", "-c:a", "copy", output_path],
         check=True,
     )
+    log_preview_frames(VideoFileClip(output_path), "final")
     print("Thai translation complete!")
 
 if __name__ == "__main__":
