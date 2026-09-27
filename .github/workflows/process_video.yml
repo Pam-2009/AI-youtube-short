@@ -37,7 +37,7 @@ jobs:
       - name: Install System FFmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg tesseract-ocr fonts-thai-tlwg
 
       - name: Install Python Dependencies
         run: |
@@ -47,6 +47,7 @@ jobs:
       - name: Run Video Pipeline
         env:
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           python main.py "${{ github.event.inputs.video_url }}" "${{ github.event.inputs.start_time }}" "${{ github.event.inputs.end_time }}"
 
