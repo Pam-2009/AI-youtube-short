@@ -223,22 +223,30 @@ def log_preview_frames(clip, label):
         print(f"PREVIEW {label} t={t:.1f} {base64.b64encode(jpg.tobytes()).decode()}")
 
 
-def blur_boxes(frame, boxes, pad=12):
-    frame = frame.copy()
-    h, w = frame.shape[:2]
-    for x, y, bw, bh in boxes:
-        x1, y1 = max(0, x - pad), max(0, y - pad)
-        x2, y2 = min(w, x + bw + pad), min(h, y + bh + pad)
-        if x2 > x1 and y2 > y1:
-            frame[y1:y2, x1:x2] = cv2.GaussianBlur(frame[y1:y2, x1:x2], (0, 0), 25)
-    return frame
+def keep_caption_boxes(samples, height):
+    # ซับอยู่แถวเดียวกันตลอด: เก็บเฉพาะกล่องที่อยู่ใกล้แนวซับ (ตัดจุดที่ OCR อ่านผิดทิ้ง)
+    centers = sorted(y + bh / 2 for _, bs in samples for (_, y, _, bh) in bs)
+    if not centers:
+        return samples, None
+    line_y = centers[len(centers) // 2]
+    kept = [(t, [b for b in bs if abs(b[1] + b[3] / 2 - line_y) < height * 0.1]) for t, bs in samples]
+    return kept, line_y
 
 
 def remove_english_text(video, samples, step):
+    # เบลอทั้งแถบแนวนอนตรงที่มีซับอังกฤษ (กันตัวอักษรหลุดขอบ) และทำให้มืดลงนิดหน่อยให้ซับไทยอ่านง่าย
     def process(get_frame, t):
-        boxes = [b for st, bs in samples if abs(st - t) <= step for b in bs]
         frame = get_frame(t)
-        return blur_boxes(frame, boxes) if boxes else frame
+        boxes = [b for st, bs in samples if abs(st - t) <= step for b in bs]
+        if not boxes:
+            return frame
+        h = frame.shape[0]
+        y1 = max(0, min(b[1] for b in boxes) - 20)
+        y2 = min(h, max(b[1] + b[3] for b in boxes) + 20)
+        frame = frame.copy()
+        strip = cv2.GaussianBlur(frame[y1:y2], (0, 0), 30)
+        frame[y1:y2] = (strip * 0.7).astype(np.uint8)
+        return frame
     return video.fl(process)
 
 
@@ -264,12 +272,11 @@ def ass_time(sec):
     return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
 
 
-def write_thai_subtitles(thai, voice_duration, size, samples, path="thai_subs.ass"):
+def write_thai_subtitles(thai, voice_duration, size, line_y, path="thai_subs.ass"):
     w, h = size
     # วางซับไทยตรงที่ตัวหนังสืออังกฤษเคยอยู่ (ถ้าไม่เจอ วางไว้ช่วงล่างของจอ)
-    centers = sorted(y + bh / 2 for _, bs in samples for (_, y, _, bh) in bs)
-    y_pos = centers[len(centers) // 2] if centers else h * 0.72
-    font_size = int(h * 0.052)
+    y_pos = line_y if line_y is not None else h * 0.72
+    font_size = int(h * 0.056)
 
     # เวลาแต่ละบรรทัดคิดตามจำนวนตัวอักษร (เสียงพูดเร็วพอ ๆ กันตลอด)
     lines = split_thai_lines(thai)
@@ -329,13 +336,14 @@ def translate_to_thai(file_path, output_path="output_thai_short.mp4"):
     log_preview_frames(video, "original")
     # หาตัวหนังสือจากวิดีโอต้นฉบับก่อนเปลี่ยนความเร็ว
     samples, step = find_english_text(video)
+    samples, line_y = keep_caption_boxes(samples, video.h)
     cleaned = remove_english_text(video, samples, step)
     thai_voice, cleaned = fit_voice_to_video(voice_path, cleaned)
     # ตัดเสียงต้นฉบับ (เสียงพูดภาษาอังกฤษ) ออกทั้งหมด ใช้เสียงไทยอย่างเดียว
     cleaned = cleaned.set_audio(thai_voice)
     cleaned.write_videofile("thai_no_subs.mp4", codec="libx264", audio_codec="aac")
 
-    subs = write_thai_subtitles(thai, thai_voice.duration, video.size, samples)
+    subs = write_thai_subtitles(thai, thai_voice.duration, video.size, line_y)
     ffmpeg = shutil.which("ffmpeg") or get_ffmpeg_exe()
     subprocess.run(
         [ffmpeg, "-y", "-loglevel", "error", "-i", "thai_no_subs.mp4",
