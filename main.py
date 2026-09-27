@@ -1,9 +1,11 @@
 import sys
 import os
+import re
 import subprocess
+import time
 import anthropic
 import yt_dlp
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from imageio_ffmpeg import get_ffmpeg_exe
 from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
 from elevenlabs.client import ElevenLabs
@@ -56,11 +58,27 @@ def transcribe(client, file_path):
     return text
 
 
+def translate_free(text):
+    # Google มักบล็อกเซิร์ฟเวอร์ของ GitHub ชั่วคราว: ลองใหม่ 3 ครั้ง แล้วค่อยใช้ MyMemory (ฟรีเหมือนกัน)
+    for attempt in range(3):
+        try:
+            print("Translating to Thai with Google Translate (free)...")
+            return GoogleTranslator(source="auto", target="th").translate(text)
+        except Exception as e:
+            print(f"Google Translate failed ({e.__class__.__name__}), retrying...")
+            time.sleep(5 * (attempt + 1))
+
+    # MyMemory รับได้ครั้งละ ~500 ตัวอักษร จึงแปลทีละประโยค
+    print("Translating to Thai with MyMemory (free)...")
+    translator = MyMemoryTranslator(source="english", target="thai")
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    return " ".join(translator.translate(s) for s in sentences)
+
+
 def translate_text_to_thai(text, duration_sec):
     # ใช้ Google Translate ฟรีเป็นค่าเริ่มต้น ถ้าตั้ง ANTHROPIC_API_KEY ไว้จะใช้ Claude (แปลเป็นธรรมชาติกว่า)
     if not os.getenv("ANTHROPIC_API_KEY"):
-        print("Translating to Thai with Google Translate (free)...")
-        thai = GoogleTranslator(source="auto", target="th").translate(text)
+        thai = translate_free(text)
         print(f"Thai: {thai}")
         return thai
 
