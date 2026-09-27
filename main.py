@@ -3,6 +3,7 @@ import os
 import subprocess
 import anthropic
 import yt_dlp
+from deep_translator import GoogleTranslator
 from imageio_ffmpeg import get_ffmpeg_exe
 from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
 from elevenlabs.client import ElevenLabs
@@ -56,8 +57,12 @@ def transcribe(client, file_path):
 
 
 def translate_text_to_thai(text, duration_sec):
+    # ใช้ Google Translate ฟรีเป็นค่าเริ่มต้น ถ้าตั้ง ANTHROPIC_API_KEY ไว้จะใช้ Claude (แปลเป็นธรรมชาติกว่า)
     if not os.getenv("ANTHROPIC_API_KEY"):
-        raise ValueError("ANTHROPIC_API_KEY environment variable is not set.")
+        print("Translating to Thai with Google Translate (free)...")
+        thai = GoogleTranslator(source="auto", target="th").translate(text)
+        print(f"Thai: {thai}")
+        return thai
 
     print("Translating to Thai with Claude...")
     client = anthropic.Anthropic()
